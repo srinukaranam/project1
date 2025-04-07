@@ -1,0 +1,525 @@
+from flask import Flask, render_template, request, redirect, url_for, session, flash, g
+import yfinance as yf
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from datetime import datetime, timedelta
+from sklearn.preprocessing import MinMaxScaler
+import plotly
+import plotly.graph_objects as go
+import json
+import sqlite3
+import hashlib
+import os
+import time
+from functools import wraps
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+# Application Configuration
+class Config:
+    SECRET_KEY = "your_secret_key_123"
+    DATABASE = 'stocksense.db'
+    PREDICTION_CACHE_DAYS = 3
+    REQUEST_TIMEOUT = 30
+    THROTTLE_DELAY = 0.5  # seconds between Yahoo Finance requests
+
+app = Flask(__name__)
+app.config.from_object(Config)
+
+# Constants
+DEFAULT_STOCKS = {
+    'Indian Stocks': {
+        'RELIANCE.NS': 'Reliance Industries',
+        'TCS.NS': 'Tata Consultancy Services',
+        'HDFCBANK.NS': 'HDFC Bank'
+    },
+    'US Stocks': {
+        'AAPL': 'Apple',
+        'MSFT': 'Microsoft',
+        'GOOGL': 'Alphabet'
+    }
+}
+
+CURRENCY_SYMBOLS = {
+    'INR': '₹', 'USD': '$', 'KRW': '₩', 'JPY': '¥',
+    'GBP': '£', 'EUR': '€', 'CNY': '¥'
+}
+
+# Database Setup
+def get_db():
+    if 'db' not in g:
+        g.db = sqlite3.connect(app.config['DATABASE'])
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exception=None):
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
+
+def init_db():
+    with app.app_context():
+        db = get_db()
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS predictions_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            predictions TEXT NOT NULL,
+            company_info TEXT NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(ticker, start_date, end_date)
+        )""")
+        db.commit()
+
+def migrate_db():
+    with app.app_context():
+        db = get_db()
+        try:
+            result = db.execute("PRAGMA table_info(predictions_cache)").fetchall()
+            columns = [col[1] for col in result]
+            
+            if 'company_info' not in columns:
+                db.execute("ALTER TABLE predictions_cache ADD COLUMN company_info TEXT NOT NULL DEFAULT '{}'")
+                db.commit()
+                app.logger.info("Database schema migrated successfully")
+        except Exception as e:
+            app.logger.error(f"Migration failed: {str(e)}")
+            db.rollback()
+
+if not os.path.exists(app.config['DATABASE']):
+    init_db()
+else:
+    migrate_db()
+
+# Utility Functions
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Please log in to access this page', 'warning')
+            return redirect(url_for('login', next=request.url))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def is_valid_ticker(ticker):
+    """Check if the ticker exists and has data available"""
+    if not ticker or ticker.upper() == 'NONE':
+        return False
+    
+    try:
+        stock = yf.Ticker(ticker)
+        if not stock.info.get('symbol'):
+            return False
+        return True
+    except Exception:
+        return False
+
+def get_ticker_suggestions(partial_ticker):
+    try:
+        search = yf.Ticker(partial_ticker)
+        if search.info:
+            return [search.info.get('symbol', partial_ticker)]
+        return []
+    except:
+        return []
+
+# Template Filters
+@app.template_filter('datetimeformat')
+def datetimeformat(value, format='%Y-%m-%d'):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        try:
+            value = datetime.strptime(value, '%Y-%m-%d')
+        except ValueError:
+            return value
+    return value.strftime(format)
+
+@app.template_filter('format_number')
+def format_number(value):
+    try:
+        if value is None:
+            return "0"
+        value = float(value)
+        if abs(value) >= 1_000_000_000:
+            return f"{value/1_000_000_000:.2f}B"
+        elif abs(value) >= 1_000_000:
+            return f"{value/1_000_000:.2f}M"
+        elif abs(value) >= 1_000:
+            return f"{value:,.0f}"
+        return f"{value:,.2f}"
+    except (ValueError, TypeError):
+        return "0"
+
+# Context Processors
+@app.context_processor
+def inject_defaults():
+    return dict(
+        default_stocks=DEFAULT_STOCKS,
+        current_year=datetime.now().year
+    )
+
+# Data Functions
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def fetch_yfinance_data(ticker, period):
+    """Fetch stock data with better error handling"""
+    try:
+        if not ticker:
+            raise ValueError("Empty ticker provided")
+            
+        stock = yf.Ticker(ticker)
+        if not stock.info:
+            raise ValueError("No stock info available")
+        
+        data = yf.download(ticker, period=period, progress=False)
+        
+        if data.empty:
+            raise ValueError("No data returned from Yahoo Finance")
+            
+        return data
+        
+    except Exception as e:
+        app.logger.error(f"Failed to fetch data for {ticker}: {str(e)}")
+        raise ValueError(f"Could not fetch data for {ticker}. Please try another symbol.")
+
+def get_company_info(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        return {
+            'name': info.get('longName', ticker),
+            'symbol': ticker,
+            'sector': info.get('sector', 'N/A'),
+            'industry': info.get('industry', 'N/A'),
+            'marketCap': info.get('marketCap'),
+            'website': info.get('website', '#'),
+            'summary': info.get('longBusinessSummary', 'No description available'),
+            'country': info.get('country', 'N/A'),
+            'currency': info.get('currency', 'USD')
+        }
+    except Exception as e:
+        app.logger.warning(f"Couldn't fetch company info for {ticker}: {str(e)}")
+        return {
+            'name': ticker,
+            'symbol': ticker,
+            'sector': 'N/A',
+            'industry': 'N/A',
+            'marketCap': None,
+            'website': '#',
+            'summary': 'No description available',
+            'country': 'N/A',
+            'currency': 'USD'
+        }
+
+def get_currency_symbol(currency_code):
+    return CURRENCY_SYMBOLS.get(currency_code, '$')
+
+# Model Functions
+def create_model(input_shape):
+    model = tf.keras.Sequential([
+        tf.keras.layers.LSTM(64, return_sequences=True, input_shape=input_shape),
+        tf.keras.layers.Dropout(0.2),
+        tf.keras.layers.LSTM(32),
+        tf.keras.layers.Dropout(0.2),
+        tf.keras.layers.Dense(14)
+    ])
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+def prepare_training_data(data, sequence_length=30, prediction_days=7):
+    scaler = MinMaxScaler()
+    prices = data[['Open', 'Close']].dropna()
+    scaled_data = scaler.fit_transform(prices)
+    
+    X, y = [], []
+    for i in range(sequence_length, len(scaled_data) - prediction_days):
+        X.append(scaled_data[i-sequence_length:i])
+        y.append(scaled_data[i:i+prediction_days].flatten())
+    
+    return np.array(X), np.array(y), scaler
+
+# Cache Functions
+def get_cached_prediction(ticker, start_date, end_date):
+    db = get_db()
+    try:
+        column_check = db.execute(
+            "PRAGMA table_info(predictions_cache)"
+        ).fetchall()
+        
+        has_company_info = any(col[1] == 'company_info' for col in column_check)
+        
+        if not has_company_info:
+            return None
+            
+        result = db.execute(
+            """SELECT predictions, company_info 
+               FROM predictions_cache 
+               WHERE ticker = ? AND start_date = ? AND end_date = ?
+               AND created_at > datetime('now', ?)""",
+            (ticker, start_date, end_date, f"-{app.config['PREDICTION_CACHE_DAYS']} days")
+        ).fetchone()
+        
+        if result:
+            return {
+                'predictions': json.loads(result['predictions']),
+                'company_info': json.loads(result['company_info'])
+            }
+    except Exception as e:
+        app.logger.error(f"Error checking cache: {str(e)}")
+    return None
+
+def cache_prediction(ticker, start_date, end_date, predictions, company_info):
+    db = get_db()
+    try:
+        db.execute(
+            """INSERT OR REPLACE INTO predictions_cache 
+               (ticker, start_date, end_date, predictions, company_info) 
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                ticker,
+                start_date,
+                end_date,
+                json.dumps(predictions),
+                json.dumps(company_info)
+            )
+        )
+        db.commit()
+    except Exception as e:
+        app.logger.error(f"Failed to cache prediction: {str(e)}")
+
+# Visualization Function
+def create_plot(predictions, ticker, currency):
+    if not predictions or len(predictions) == 0:
+        app.logger.error("No prediction data available for graph")
+        return None
+    
+    try:
+        fig = go.Figure()
+        dates = [p['date'] for p in predictions]
+        
+        if not all(isinstance(p['open'], (int, float)) for p in predictions):
+            app.logger.error("Invalid open price data")
+            return None
+            
+        if not all(isinstance(p['close'], (int, float)) for p in predictions):
+            app.logger.error("Invalid close price data")
+            return None
+
+        fig.add_trace(go.Scatter(
+            x=dates, 
+            y=[p['open'] for p in predictions],
+            name=f'Open ({currency})',
+            line=dict(color='#3b82f6', width=2),
+            hovertemplate='Date: %{x}<br>Open: %{y:.2f} '+currency
+        ))
+        
+        fig.add_trace(go.Scatter(
+            x=dates, 
+            y=[p['close'] for p in predictions],
+            name=f'Close ({currency})',
+            line=dict(color='#ef4444', width=2),
+            hovertemplate='Date: %{x}<br>Close: %{y:.2f} '+currency
+        ))
+        
+        fig.update_layout(
+            title=f"{ticker} Price Predictions",
+            xaxis_title="Date",
+            yaxis_title=f"Price ({currency})",
+            template="plotly_white",
+            hovermode='x unified',
+            margin=dict(l=50, r=50, b=50, t=50, pad=4),
+            legend=dict(orientation='h', y=1.1)
+        )
+        
+        return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+    
+    except Exception as e:
+        app.logger.error(f"Error creating plot: {str(e)}")
+        return None
+
+# Routes
+@app.route('/')
+@login_required
+def landing():
+    today = datetime.now().strftime('%Y-%m-%d')
+    next_week = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
+    return render_template('app.html',
+                         current_date=today,
+                         current_end_date=next_week,
+                         predictions=[],
+                         graphJSON=None,
+                         company=None,
+                         ticker=None,
+                         currency_symbol='$')
+
+@app.route('/predict', methods=['POST'])
+@login_required
+def predict():
+    form_data = request.form
+    ticker = form_data.get('ticker', '').upper().strip()
+    
+    if not ticker or not is_valid_ticker(ticker):
+        flash('Invalid stock symbol. Please enter a valid ticker.', 'error')
+        return redirect(url_for('landing'))
+    
+    try:
+        start_date = form_data['start_date']
+        end_date = form_data['end_date']
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+        
+        if start_dt > end_dt:
+            raise ValueError("End date must be after start date")
+        
+        cached = get_cached_prediction(ticker, start_date, end_date)
+        if cached:
+            company_info = cached['company_info']
+            currency_symbol = get_currency_symbol(company_info.get('currency', 'USD'))
+            graphJSON = create_plot(cached['predictions'], ticker, currency_symbol)
+            
+            if not graphJSON:
+                flash('Error generating graph from cached data', 'error')
+                return redirect(url_for('landing'))
+            
+            return render_template('app.html',
+                                predictions=cached['predictions'],
+                                graphJSON=graphJSON,
+                                company=company_info,
+                                ticker=ticker,
+                                currency_symbol=currency_symbol,
+                                from_cache=True)
+        
+        company_info = get_company_info(ticker)
+        currency_symbol = get_currency_symbol(company_info.get('currency', 'USD'))
+        
+        data = fetch_yfinance_data(ticker, form_data.get('period', '3mo'))
+        
+        X, y, scaler = prepare_training_data(data)
+        if len(X) < 1:
+            raise ValueError("Insufficient historical data for prediction")
+        
+        model = create_model(X.shape[1:])
+        model.fit(X, y, epochs=5, batch_size=32, verbose=0)
+        
+        predictions = []
+        window = data[['Open', 'Close']].iloc[-30:].values
+        window = scaler.transform(window)
+        
+        pred_dates = pd.date_range(start_date, end_date, freq='B')
+        for date in pred_dates:
+            pred = model.predict(np.array([window]), verbose=0)[0]
+            prices = scaler.inverse_transform([pred[:2]])[0]
+            
+            predictions.append({
+                'date': date.strftime('%Y-%m-%d'),
+                'open': float(prices[0]),
+                'close': float(prices[1]),
+                'currency': currency_symbol
+            })
+            
+            window = np.vstack([window[1:], [pred[0], pred[1]]])
+        
+        graphJSON = create_plot(predictions, ticker, currency_symbol)
+        
+        if not graphJSON:
+            flash('Error generating prediction graph', 'error')
+            return redirect(url_for('landing'))
+        
+        cache_prediction(ticker, start_date, end_date, predictions, company_info)
+        
+        return render_template('app.html',
+                            predictions=predictions,
+                            graphJSON=graphJSON,
+                            company=company_info,
+                            ticker=ticker,
+                            currency_symbol=currency_symbol)
+    
+    except ValueError as e:
+        flash(str(e), 'error')
+        return redirect(url_for('landing'))
+    except Exception as e:
+        app.logger.error(f"Prediction error: {str(e)}", exc_info=True)
+        flash("An error occurred during prediction. Please try again with a different symbol.", 'error')
+        return redirect(url_for('landing'))
+
+# Auth Routes
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '').strip()
+        
+        if not username or not password:
+            flash('Please fill in all fields', 'error')
+            return render_template('login.html')
+        
+        db = get_db()
+        user = db.execute(
+            "SELECT * FROM users WHERE username = ?",
+            (username,)
+        ).fetchone()
+        
+        if user and user['password'] == hash_password(password):
+            session['user_id'] = user['id']
+            session['username'] = user['username']
+            flash('Login successful!', 'success')
+            return redirect(url_for('landing'))
+        
+        flash('Invalid username or password', 'error')
+    
+    return render_template('login.html')
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '').strip()
+        email = request.form.get('email', '').strip().lower()
+        
+        if not all([username, password, email]):
+            flash('Please fill in all fields', 'error')
+            return render_template('register.html')
+        
+        db = get_db()
+        try:
+            db.execute(
+                "INSERT INTO users (username, password, email) VALUES (?, ?, ?)",
+                (username, hash_password(password), email)
+            )
+            db.commit()
+            flash('Registration successful! Please login.', 'success')
+            return redirect(url_for('login'))
+        except sqlite3.IntegrityError as e:
+            if 'username' in str(e):
+                flash('Username already exists', 'error')
+            else:
+                flash('Email already exists', 'error')
+        except Exception as e:
+            app.logger.error(f"Registration error: {str(e)}")
+            flash('Registration failed. Please try again.', 'error')
+    
+    return render_template('register.html')
+
+@app.route('/logout')
+@login_required
+def logout():
+    session.clear()
+    flash('You have been logged out', 'info')
+    return redirect(url_for('login'))
+
+if __name__ == '__main__':
+    app.run(debug=True)
